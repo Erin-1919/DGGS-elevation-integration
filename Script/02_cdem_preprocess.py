@@ -1,150 +1,375 @@
-###################################################
-#### CDEM pre-processing (convert to CGVD2013)  ###
-###################################################
+#!/usr/bin/env python3
+"""
+CDEM Pre-processing Script for DGGS Elevation Integration
 
-### mosaic CDEMs
-# if download CDEM manually using the Geospatial-Data Extraction tool 
-# this step can be skipped
-import gc, glob, rasterio, os
-from rasterio.merge import merge
+This script handles the pre-processing of Canadian Digital Elevation Model (CDEM) data:
+- Mosaicking multiple CDEM tiles
+- Converting to NAD83 CSRS geographic coordinate system
+- Converting vertical datum from CGVD1928 to CGVD2013
+- Cropping to study area extent
 
-# find out all CDEMs in the folder
-dem_fps = glob.glob('Data/CDEM_*.tif')
-src_files_to_mosaic = []
+Author: Mingke Li
+Date: 2021
+"""
 
-for fp in dem_fps:
-    src = rasterio.open(fp)
-    src_files_to_mosaic.append(src)
-
-# if there is only one CDEM tile then skip the mosaic process and rename the tile
-if len(src_files_to_mosaic) == 1:
-    src.close()
-    os.rename('Data/CDEM_1.tif', 'Data/CDEM_mosaic.tif')
-else:
-    # Merge function returns a single mosaic array and the transformation info
-    mosaic_dem, mosaic_trans = merge(src_files_to_mosaic, res=src.res, nodata=-32767.0, method='first')
-    # Copy the metadata
-    mosaic_meta = src.meta.copy()
-    # Update the metadata
-    mosaic_meta.update({"driver":"GTiff","height":mosaic_dem.shape[1],"width":mosaic_dem.shape[2], "compress":'lzw', 
-                        "count":1,"nodata":-32767.0,"transform":mosaic_trans,"crs":"EPSG:4617"})
-    # Write the mosaic raster to disk
-    with rasterio.open("Data/CDEM_mosaic.tif", "w", **mosaic_meta) as dest:
-        dest.write(mosaic_dem)
-    src.close()
-    del mosaic_dem, mosaic_trans, mosaic_meta
-    gc.collect()
-
-print ("Mosaic CDEMs successfully!")
-
-### inversely project CDEM to geographic CRS
-# if download CDEM manually using the Geospatial-Data Extraction tool 
-# this step can be skipped
-import rasterio, gdal
-
-# convert to NAD83 CSRS 
-cdem_mosaic = rasterio.open('Data/CDEM_mosaic.tif')
-wrap_option = gdal.WarpOptions(format = cdem_mosaic.meta.get('driver'), 
-                   outputType = gdal.GDT_Float32,
-                   srcSRS = cdem_mosaic.meta.get('crs'),
-                   dstSRS = 'EPSG:4617', # NAD83(CSRS)
-                   dstNodata = cdem_mosaic.meta.get('nodata'),
-                   creationOptions = ['COMPRESS=LZW'])
-gdal.Warp('Data/CDEM_mosaic_4617.tif', 'Data/CDEM_mosaic.tif', options = wrap_option)
-
-print ("Inversely project CDEM successfully!")
-    
-### Unify CDEM and BYN rasters for inputs of band calculation
+import sys
+import os
+import gc
+import glob
+import logging
 import json
-import rasterio, gdal
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+import rasterio
+import numpy as np
 import geopandas as gpd
+from rasterio.merge import merge
 from rasterio.mask import mask
+from rasterio.warp import reproject, Resampling
+import gdal
 
-# load rasters
-cdem_cgvd1928 = rasterio.open('Data/CDEM_mosaic_4617.tif')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('cdem_preprocess.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# load study area shp
-boundingbox_gdf = gpd.GeoDataFrame.from_file('Data/study_area.shp')
-boundingbox_gdf = boundingbox_gdf.set_crs("EPSG:4617") # NAD83 CSRS
+# Constants
+NAD83_CSRS_EPSG = "EPSG:4617"
+NO_DATA_VALUE = -32767.0
+COMPRESSION = 'lzw'
 
-def getFeatures(gdf):
-    ''' A funcion to parse features from GeoDataFrame in such a manner that rasterio wants them '''
+
+class CDEMPreprocessError(Exception):
+    """Custom exception for CDEM pre-processing errors."""
+    pass
+
+
+def setup_directories() -> None:
+    """Create necessary directories if they don't exist."""
+    Path("Data").mkdir(exist_ok=True)
+    Path("Result").mkdir(exist_ok=True)
+
+
+def find_cdem_files() -> List[str]:
+    """
+    Find all CDEM files in the Data directory.
+    
+    Returns:
+        List of CDEM file paths
+    """
+    cdem_files = glob.glob('Data/CDEM_*.tif')
+    if not cdem_files:
+        raise CDEMPreprocessError("No CDEM files found in Data directory")
+    
+    logger.info(f"Found {len(cdem_files)} CDEM files")
+    return cdem_files
+
+
+def mosaic_cdem_files(cdem_files: List[str]) -> str:
+    """
+    Mosaic multiple CDEM files into a single file.
+    
+    Args:
+        cdem_files: List of CDEM file paths
+        
+    Returns:
+        Path to the mosaicked file
+    """
+    logger.info("Starting CDEM mosaicking...")
+    
+    if len(cdem_files) == 1:
+        # If only one file, just rename it
+        src = rasterio.open(cdem_files[0])
+        src.close()
+        output_path = 'Data/CDEM_mosaic.tif'
+        os.rename(cdem_files[0], output_path)
+        logger.info("Single CDEM file renamed to mosaic")
+        return output_path
+    
+    # Open all source files
+    src_files = []
+    try:
+        for file_path in cdem_files:
+            src = rasterio.open(file_path)
+            src_files.append(src)
+        
+        # Merge files
+        mosaic_dem, mosaic_trans = merge(
+            src_files, 
+            res=src_files[0].res, 
+            nodata=NO_DATA_VALUE, 
+            method='first'
+        )
+        
+        # Copy metadata and update
+        mosaic_meta = src_files[0].meta.copy()
+        mosaic_meta.update({
+            "driver": "GTiff",
+            "height": mosaic_dem.shape[1],
+            "width": mosaic_dem.shape[2],
+            "compress": COMPRESSION,
+            "count": 1,
+            "nodata": NO_DATA_VALUE,
+            "transform": mosaic_trans,
+            "crs": NAD83_CSRS_EPSG
+        })
+        
+        # Write mosaic to disk
+        output_path = "Data/CDEM_mosaic.tif"
+        with rasterio.open(output_path, "w", **mosaic_meta) as dest:
+            dest.write(mosaic_dem)
+        
+        logger.info(f"CDEM mosaic created successfully: {output_path}")
+        return output_path
+        
+    finally:
+        # Clean up
+        for src in src_files:
+            src.close()
+        del mosaic_dem, mosaic_trans, mosaic_meta
+        gc.collect()
+
+
+def reproject_to_geographic(input_path: str, output_path: str) -> None:
+    """
+    Reproject CDEM to NAD83 CSRS geographic coordinate system.
+    
+    Args:
+        input_path: Path to input raster
+        output_path: Path to output raster
+    """
+    logger.info("Reprojecting CDEM to geographic coordinates...")
+    
+    try:
+        with rasterio.open(input_path) as src:
+            # Define warp options
+            warp_options = gdal.WarpOptions(
+                format=src.meta.get('driver'),
+                outputType=gdal.GDT_Float32,
+                srcSRS=src.meta.get('crs'),
+                dstSRS=NAD83_CSRS_EPSG,
+                dstNodata=src.meta.get('nodata'),
+                creationOptions=[f'COMPRESS={COMPRESSION.upper()}']
+            )
+            
+            # Perform warp
+            gdal.Warp(output_path, input_path, options=warp_options)
+        
+        logger.info(f"Reprojection completed: {output_path}")
+        
+    except Exception as e:
+        raise CDEMPreprocessError(f"Failed to reproject CDEM: {e}")
+
+
+def get_features_from_geodataframe(gdf: gpd.GeoDataFrame) -> List[dict]:
+    """
+    Parse features from GeoDataFrame in a format that rasterio expects.
+    
+    Args:
+        gdf: GeoDataFrame
+        
+    Returns:
+        List of feature geometries
+    """
     return [json.loads(gdf.to_json())['features'][0]['geometry']]
 
-# call the function to get coords in json
-boundingbox_coords = getFeatures(boundingbox_gdf)
 
-# crop the mosaic CDEM to the extent of study area
-cdem_out_img, cdem_out_transform = mask(dataset=cdem_cgvd1928, shapes=boundingbox_coords, crop=True)
-cdem_out_meta = cdem_cgvd1928.meta.copy()
-cdem_out_meta.update({'height': int(cdem_out_img.shape[1]),'width': int(cdem_out_img.shape[2]), 
-                      "transform": cdem_out_transform,"compress":'lzw'})
+def crop_raster_to_study_area(raster_path: str, study_area_path: str, output_path: str) -> None:
+    """
+    Crop raster to the extent of study area.
+    
+    Args:
+        raster_path: Path to input raster
+        study_area_path: Path to study area shapefile
+        output_path: Path to output raster
+    """
+    logger.info("Cropping raster to study area...")
+    
+    try:
+        # Load raster and study area
+        with rasterio.open(raster_path) as raster:
+            study_area = gpd.GeoDataFrame.from_file(study_area_path)
+            study_area = study_area.set_crs(NAD83_CSRS_EPSG)
+            
+            # Get features for masking
+            features = get_features_from_geodataframe(study_area)
+            
+            # Perform masking
+            out_image, out_transform = mask(
+                dataset=raster, 
+                shapes=features, 
+                crop=True
+            )
+            
+            # Update metadata
+            out_meta = raster.meta.copy()
+            out_meta.update({
+                'height': int(out_image.shape[1]),
+                'width': int(out_image.shape[2]),
+                'transform': out_transform,
+                'compress': COMPRESSION
+            })
+            
+            # Write output
+            with rasterio.open(output_path, "w", **out_meta) as dest:
+                dest.write(out_image)
+        
+        logger.info(f"Raster cropped successfully: {output_path}")
+        
+    except Exception as e:
+        raise CDEMPreprocessError(f"Failed to crop raster: {e}")
 
-cdem_cgvd1928.close()
 
-# output clipped rasters
-with rasterio.open('Data/CDEM_mosaic_temp.tif', "w", **cdem_out_meta) as dest:
-    dest.write(cdem_out_img)
+def reproject_image_to_master(master_path: str, slave_path: str) -> str:
+    """
+    Reproject a raster (slave) to match the extent, resolution and projection of another raster (master).
+    
+    Args:
+        master_path: Path to master raster
+        slave_path: Path to slave raster
+        
+    Returns:
+        Path to reprojected slave raster
+    """
+    logger.info("Reprojecting slave raster to match master...")
+    
+    try:
+        # Open datasets
+        slave_ds = gdal.Open(slave_path)
+        master_ds = gdal.Open(master_path)
+        
+        if not slave_ds or not master_ds:
+            raise CDEMPreprocessError("Failed to open raster datasets")
+        
+        # Get properties
+        slave_proj = slave_ds.GetProjection()
+        data_type = slave_ds.GetRasterBand(1).DataType
+        n_bands = slave_ds.RasterCount
+        master_proj = master_ds.GetProjection()
+        master_geotrans = master_ds.GetGeoTransform()
+        w = master_ds.RasterXSize
+        h = master_ds.RasterYSize
+        
+        # Create output filename
+        output_path = slave_path.replace(".byn", "_temp.tif")
+        
+        # Create output dataset
+        dst_ds = gdal.GetDriverByName('GTiff').Create(
+            output_path, w, h, n_bands, data_type
+        )
+        dst_ds.SetGeoTransform(master_geotrans)
+        dst_ds.SetProjection(master_proj)
+        dst_ds.GetRasterBand(1).SetNoDataValue(NO_DATA_VALUE)
+        
+        # Perform reprojection
+        gdal.ReprojectImage(
+            slave_ds, dst_ds, slave_proj, master_proj, 
+            gdal.GRA_NearestNeighbour
+        )
+        
+        # Clean up
+        dst_ds = None
+        slave_ds = None
+        master_ds = None
+        
+        logger.info(f"Reprojection completed: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        raise CDEMPreprocessError(f"Failed to reproject image: {e}")
 
-del cdem_out_img, cdem_out_transform
-gc.collect()
 
-def reproject_image_to_master(master,slave):
-    """A function to reproject a raster (slave) to
-    match the extent, resolution and projection of another
-    raster (master) using GDAL."""
-    slave_ds = gdal.Open(slave)
-    slave_proj = slave_ds.GetProjection()
-    data_type = slave_ds.GetRasterBand(1).DataType
-    n_bands = slave_ds.RasterCount
-    master_ds = gdal.Open(master)
-    master_proj = master_ds.GetProjection()
-    master_geotrans = master_ds.GetGeoTransform()
-    w = master_ds.RasterXSize
-    h = master_ds.RasterYSize
-    dst_filename = slave.replace(".byn","_temp.tif" )
-    dst_ds = gdal.GetDriverByName('GTiff').Create(dst_filename, w, h, n_bands, data_type)
-    dst_ds.SetGeoTransform(master_geotrans)
-    dst_ds.SetProjection(master_proj)
-    dst_ds.GetRasterBand(1).SetNoDataValue(-32767.0)
-    gdal.ReprojectImage(slave_ds, dst_ds, slave_proj, master_proj, gdal.GRA_NearestNeighbour)
-    dst_ds = None
-    return dst_filename
+def convert_to_cgvd2013(cdem_path: str, byn_path: str, output_path: str) -> None:
+    """
+    Convert vertical datum from CGVD1928 to CGVD2013.
+    
+    Args:
+        cdem_path: Path to CDEM raster (CGVD1928)
+        byn_path: Path to BYN raster (conversion grid)
+        output_path: Path to output raster (CGVD2013)
+    """
+    logger.info("Converting vertical datum to CGVD2013...")
+    
+    try:
+        # Load rasters
+        with rasterio.open(cdem_path) as cdem_src, rasterio.open(byn_path) as byn_src:
+            # Read data
+            cgvd1928 = cdem_src.read(1)
+            delta_dem = byn_src.read(1)
+            
+            # Perform conversion: CGVD2013 = CGVD1928 - delta_dem/1000
+            cgvd2013 = cgvd1928 - delta_dem / 1000
+            
+            # Handle invalid values
+            cgvd2013 = np.where(cgvd2013 < -1000, NO_DATA_VALUE, cgvd2013)
+            
+            # Update metadata
+            cgvd2013_meta = cdem_src.meta.copy()
+            cgvd2013_meta.update({"compress": COMPRESSION})
+            
+            # Write output
+            with rasterio.open(output_path, "w", **cgvd2013_meta) as dest:
+                dest.write(cgvd2013.astype(rasterio.float32), 1)
+        
+        logger.info(f"Vertical datum conversion completed: {output_path}")
+        
+    except Exception as e:
+        raise CDEMPreprocessError(f"Failed to convert vertical datum: {e}")
 
-# call function to unify CDEM and BYN rasters
-reproject_image_to_master('Data/CDEM_mosaic_temp.tif', 'Data/HT2_2010v70_CGG2013a.byn')
 
-print ("Unify CDEM and BYN rasters successfully!")
+def main():
+    """Main function to orchestrate CDEM pre-processing."""
+    try:
+        logger.info("Starting CDEM pre-processing...")
+        
+        # Setup directories
+        setup_directories()
+        
+        # Step 1: Mosaic CDEM files
+        cdem_files = find_cdem_files()
+        mosaic_path = mosaic_cdem_files(cdem_files)
+        
+        # Step 2: Reproject to geographic coordinates
+        reprojected_path = 'Data/CDEM_mosaic_4617.tif'
+        reproject_to_geographic(mosaic_path, reprojected_path)
+        
+        # Step 3: Crop to study area
+        cropped_path = 'Data/CDEM_mosaic_temp.tif'
+        crop_raster_to_study_area(
+            reprojected_path, 
+            'Data/study_area.shp', 
+            cropped_path
+        )
+        
+        # Step 4: Unify CDEM and BYN rasters
+        byn_temp_path = reproject_image_to_master(
+            cropped_path, 
+            'Data/HT2_2010v70_CGG2013a.byn'
+        )
+        
+        # Step 5: Convert to CGVD2013
+        convert_to_cgvd2013(
+            cropped_path, 
+            byn_temp_path, 
+            'Data/CDEM_cgvd2013.tif'
+        )
+        
+        logger.info("CDEM pre-processing completed successfully")
+        
+    except CDEMPreprocessError as e:
+        logger.error(f"CDEM pre-processing failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        sys.exit(1)
 
-### convert the vertical datum to CGVD2013 
-import numpy
-import rasterio
-from matplotlib import pyplot
 
-# load rasters
-clipped_cdem = rasterio.open('Data/CDEM_mosaic_temp.tif')
-clipped_byn = rasterio.open('Data/HT2_2010v70_CGG2013a_temp.tif')
-
-#clipped_cdem.meta
-#clipped_byn.meta
-
-# do map algebra (band calculation)
-delta_dem = clipped_byn.read(1)
-cgvd1928 = clipped_cdem.read(1)
-cgvd2013 = cgvd1928 - delta_dem/1000
-cgvd2013 = numpy.where(cgvd2013 < -1000, -32767, cgvd2013)
-
-# update the output tif metadata
-cgvd2013_meta = clipped_cdem.meta.copy()
-cgvd2013_meta.update({"compress":'lzw'})
-
-# output the tif with cgvd2013 values
-with rasterio.open('Data/CDEM_cgvd2013.tif', "w", **cgvd2013_meta) as dest:
-    dest.write(cgvd2013.astype(rasterio.float32), 1)
-
-# plot the cdem with CGVD2013
-#src = rasterio.open("Data/CDEM_cgvd2013.tif")
-#pyplot.imshow(src.read(1), cmap='gray')
-#pyplot.show()
-
-print ("Convert to CGVD2013 successfully!")
+if __name__ == "__main__":
+    main()

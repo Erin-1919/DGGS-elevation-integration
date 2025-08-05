@@ -1,186 +1,509 @@
-###########################################################
-#### DGGS modeling -- extract values with interpolation ###
-###########################################################
+#!/usr/bin/env python3
+"""
+Control Points Validation Script for DGGS Elevation Integration
+
+This script validates DGGS modeling results using ground control points:
+- Loads ground control point data
+- Extracts pre-DGGS elevation values from DEMs
+- Calculates post-DGGS elevation values using DGGS modeling
+- Compares results across different resolution levels
+
+Author: Mingke Li
+Date: 2021
+"""
+
+import sys
+import os
+import time
+import logging
+import warnings
+from pathlib import Path
+from typing import List, Tuple, Optional, Union
 
 import rasterio
-import geopandas
-import pandas
-import numpy
-import pyRserve
+import geopandas as gpd
+import pandas as pd
+import numpy as np
 import shapely
+import pyRserve
 from scipy import interpolate
-import os
-import warnings
-import time
 
+# Enable shapely speedups
 shapely.speedups.enable()
-conn = pyRserve.connect()
-warnings.simplefilter('error', RuntimeWarning) 
-start_time = time.time()
+warnings.simplefilter('error', RuntimeWarning)
 
-## construct a look-up table, storing resolution and corresponding cell size and vertical resolution
-res_list = [16,17,18,19,20,21,22,23,24,25,26,27,28,29]
-cell_size_list = [0.005,0.003,0.001,0.0009,0.0008,0.0003,0.0003,0.0001,0.0001,0.00006,0.00003,0.00002,0.00001,0.000005]
-vertical_res_list = [0,0,0,1,1,2,2,3,3,4,4,5,5,6]
-# convert to a pandas dataframe with resolution levels as index
-look_up = pandas.DataFrame({'res': res_list, 'cell_size': cell_size_list, 'verti_res': vertical_res_list}, index = res_list)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('control_points.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-## Prepare HRDEM_extent polygons
-HRDEM_extent = geopandas.GeoDataFrame.from_file('Data/Projects_Footprints_dissolved.shp')
-HRDEM_extent = HRDEM_extent.to_crs("EPSG:4617") # NAD83 CSRS
+# Constants
+NO_DATA_VALUE = -32767.0
+NAD83_CSRS_EPSG = "EPSG:4617"
 
-## Read DEMs -- CDEM + HRDEM
-CDEM_TIF = rasterio.open('Data/CDEM_cgvd2013.tif')
-HRDEM_TIF = rasterio.open('Data/HRDEM_mosaic.tif')
-
-## Define the main funcitons  
-# define a function to convert geographic lat/lon to cell centroid position
-dggridR_import_script = '''library(dggridR)'''
-conn.eval(dggridR_import_script)
-
-conn.voidEval('''
-geo_to_centroid <- function(resolution,lon,lat) {
-  v_lat = 37.6895
-  v_lon = -51.6218
-  azimuth = 360-72.6482
-  DGG = dgconstruct(projection = "ISEA", aperture = 3, topology = "HEXAGON", res = resolution, 
-                       precision = 7, azimuth_deg =  azimuth, pole_lat_deg = v_lat, pole_lon_deg = v_lon)
-  Cell_address = dgGEO_to_SEQNUM(DGG,lon,lat)$seqnum
-  lon_c = dgSEQNUM_to_GEO(DGG,Cell_address)$lon_deg
-  lat_c = dgSEQNUM_to_GEO(DGG,Cell_address)$lat_deg
-  lon_lat = c(lon_c,lat_c)
-  return (lon_lat)
+# Resolution lookup table
+RESOLUTION_LOOKUP = {
+    16: {'cell_size': 0.005, 'vertical_res': 0},
+    17: {'cell_size': 0.003, 'vertical_res': 0},
+    18: {'cell_size': 0.001, 'vertical_res': 0},
+    19: {'cell_size': 0.0009, 'vertical_res': 1},
+    20: {'cell_size': 0.0008, 'vertical_res': 1},
+    21: {'cell_size': 0.0003, 'vertical_res': 2},
+    22: {'cell_size': 0.0003, 'vertical_res': 2},
+    23: {'cell_size': 0.0001, 'vertical_res': 3},
+    24: {'cell_size': 0.0001, 'vertical_res': 3},
+    25: {'cell_size': 0.00006, 'vertical_res': 4},
+    26: {'cell_size': 0.00003, 'vertical_res': 4},
+    27: {'cell_size': 0.00002, 'vertical_res': 5},
+    28: {'cell_size': 0.00001, 'vertical_res': 5},
+    29: {'cell_size': 0.000005, 'vertical_res': 6}
 }
-''')
 
-def fall_in(x,y):
-    ''' check if the point falls in HRDEM extent '''
-    point = shapely.geometry.Point(x,y)
-    if point.within(HRDEM_extent):
-        return 1
-    else:
+
+class ControlPointsError(Exception):
+    """Custom exception for control points processing errors."""
+    pass
+
+
+def setup_r_connection() -> pyRserve.RConnection:
+    """
+    Setup R connection for DGGS operations.
+    
+    Returns:
+        R connection object
+    """
+    try:
+        conn = pyRserve.connect()
+        
+        # Import dggridR library
+        conn.eval('library(dggridR)')
+        
+        # Define function to convert geographic coordinates to cell centroids
+        conn.voidEval('''
+        geo_to_centroid <- function(resolution, lon, lat) {
+          v_lat = 37.6895
+          v_lon = -51.6218
+          azimuth = 360-72.6482
+          DGG = dgconstruct(projection = "ISEA", aperture = 3, topology = "HEXAGON", res = resolution, 
+                           precision = 7, azimuth_deg = azimuth, pole_lat_deg = v_lat, pole_lon_deg = v_lon)
+          Cell_address = dgGEO_to_SEQNUM(DGG, lon, lat)$seqnum
+          lon_c = dgSEQNUM_to_GEO(DGG, Cell_address)$lon_deg
+          lat_c = dgSEQNUM_to_GEO(DGG, Cell_address)$lat_deg
+          lon_lat = c(lon_c, lat_c)
+          return(lon_lat)
+        }
+        ''')
+        
+        logger.info("R connection established successfully")
+        return conn
+        
+    except Exception as e:
+        raise ControlPointsError(f"Failed to setup R connection: {e}")
+
+
+def load_dem_data() -> Tuple[rasterio.DatasetReader, rasterio.DatasetReader, gpd.GeoDataFrame]:
+    """
+    Load DEM data and HRDEM extent.
+    
+    Returns:
+        Tuple containing (CDEM_TIF, HRDEM_TIF, HRDEM_extent)
+    """
+    try:
+        # Load DEMs
+        cdem_tif = rasterio.open('Data/CDEM_cgvd2013.tif')
+        hrdem_tif = rasterio.open('Data/HRDEM_mosaic.tif')
+        
+        # Load HRDEM extent
+        hrdem_extent = gpd.GeoDataFrame.from_file('Data/Projects_Footprints_dissolved.shp')
+        hrdem_extent = hrdem_extent.to_crs(NAD83_CSRS_EPSG)
+        
+        logger.info("DEM data loaded successfully")
+        return cdem_tif, hrdem_tif, hrdem_extent
+        
+    except Exception as e:
+        raise ControlPointsError(f"Failed to load DEM data: {e}")
+
+
+def check_point_in_hrdem_extent(x: float, y: float, hrdem_extent: gpd.GeoDataFrame) -> int:
+    """
+    Check if a point falls within HRDEM extent.
+    
+    Args:
+        x, y: Point coordinates
+        hrdem_extent: HRDEM extent polygon
+        
+    Returns:
+        1 if point is within extent, 0 otherwise
+    """
+    try:
+        point = shapely.geometry.Point(x, y)
+        if point.within(hrdem_extent.geometry.iloc[0]):
+            return 1
+        else:
+            return 0
+    except Exception as e:
+        logger.warning(f"Failed to check point ({x}, {y}) in HRDEM extent: {e}")
         return 0
 
-def catch(func, dem, handle = lambda e : e, *args, **kwargs):
-    ''' Handle the try except in a general function'''
+
+def safe_extract_elevation(func, dem_type: str, *args, **kwargs) -> Union[float, None]:
+    """
+    Safely extract elevation values with error handling.
+    
+    Args:
+        func: Function to call
+        dem_type: Type of DEM ('CDEM' or 'HRDEM')
+        *args, **kwargs: Arguments for the function
+        
+    Returns:
+        Elevation value or None/NO_DATA_VALUE on error
+    """
     try:
         return func(*args, **kwargs)
-    except:
-        if dem == 'CDEM':
-            return -32767
-        elif dem == 'HRDEM':
-            return numpy.nan
-
-def pre_dggs_elevation(dataframe):
-    ''' A function on the dataframe to resample DEM by nearest neighbor method '''
-    coords = [(lon,lat) for lon, lat in zip(dataframe.lon, dataframe.lat)]
-    dataframe['CDEM'] = [catch(lambda: elev[0],'CDEM') for elev in CDEM_TIF.sample(coords)]
-    dataframe['HRDEM'] = [catch(lambda: elev[0],'HRDEM') for elev in HRDEM_TIF.sample(coords)]
-    return dataframe
-
-# define a function to find neighbors for interpolation
-def find_neighbor(x,y,DEM_TIF):
-    ''' 
-    Find neighbors for interpolation --
-    determine the DEM source
-    find out the 4 neighbors geographic coords
-    extract the elevations at these 4 coords
-    convert 4 coords to array index then back to 4 coords of grid mesh centers
-    '''
-    x_index,y_index = rasterio.transform.rowcol(DEM_TIF.transform, x,y)
-    xc,yc = rasterio.transform.xy(DEM_TIF.transform, x_index, y_index)
-    if x > xc and y > yc:
-        x_index_array = [x_index-1,x_index-1,x_index,x_index]
-        y_index_array = [y_index,y_index+1,y_index,y_index+1]
-    elif x > xc and y < yc:
-        x_index_array = [x_index,x_index,x_index+1,x_index+1]
-        y_index_array = [y_index,y_index+1,y_index,y_index+1]
-    elif x < xc and y > yc:
-        x_index_array = [x_index-1,x_index-1,x_index,x_index]
-        y_index_array = [y_index-1,y_index,y_index-1,y_index]
-    elif x < xc and y < yc:
-        x_index_array = [x_index,x_index,x_index+1,x_index+1]
-        y_index_array = [y_index-1,y_index,y_index-1,y_index]
-    x_array,y_array = rasterio.transform.xy(DEM_TIF.transform, x_index_array, y_index_array)
-    coords = [(lon,lat) for lon, lat in zip(x_array,y_array)]
-    z_array = [elev[0] for elev in DEM_TIF.sample(coords)]
-    return x_array, y_array, z_array
-
-# define an extract-from-raster function to get post DGGS-modeled value
-# still need to check if cell centroid falls in the HRDEM extent instead of using the field fall_in_test
-# because a original control point falls in does not necessarily mean the corresponding cell centroid falls in
-
-def dggs_elevation_cdem(lon,lat,resolution,interp = 'linear'):
-    ''' 
-    Resample CDEM -- 
-    if an error is raised then return -32767 as its final elevation
-    if the point or any of its neighbors has the value -32767 then return -32767 as its final elevation
-    if none of its neighbor has value -32767 then interpolate elevation
-    restrict the decimal places according to the look-up table defined earlier 
-    '''
-    DEM_TIF = CDEM_TIF
-    x_y = conn.eval('geo_to_centroid('+str(resolution)+','+str(lon)+','+str(lat)+')')
-    x,y = x_y[0],x_y[1]
-    try:
-        x_array, y_array, z_array = find_neighbor(x,y,DEM_TIF)
-        if -32767 in z_array:
-            return -32767
+    except Exception as e:
+        logger.debug(f"Elevation extraction failed for {dem_type}: {e}")
+        if dem_type == 'CDEM':
+            return NO_DATA_VALUE
+        elif dem_type == 'HRDEM':
+            return None
         else:
-            CDEM_interp = interpolate.interp2d(x_array, y_array, z_array, kind=interp)
-            elevation = CDEM_interp(x,y)[0]
-            vertical_res = look_up.loc[resolution,'verti_res']
-            elevation = round(elevation,vertical_res)
-            return elevation
-    except:
-        return -32767
+            return None
 
-def dggs_elevation_hrdem(lon,lat,resolution,interp = 'linear'):
-    ''' 
-    Resample HRDEM -- 
-    if the point falls in the HRDEM data extend then proceed
-    if the point or any of its neighbors has the value -32767 then pass
-    if an error is raised then pass
-    restrict the decimal places according to the look-up table defined earlier 
-    '''
-    DEM_TIF = HRDEM_TIF
-    x_y = conn.eval('geo_to_centroid('+str(resolution)+','+str(lon)+','+str(lat)+')')
-    x,y = x_y[0],x_y[1]
-    point = shapely.geometry.Point(x,y)
-    if point.within(HRDEM_extent):
+
+def extract_pre_dggs_elevation(dataframe: pd.DataFrame, cdem_tif: rasterio.DatasetReader,
+                               hrdem_tif: rasterio.DatasetReader) -> pd.DataFrame:
+    """
+    Extract pre-DGGS elevation values from DEMs.
+    
+    Args:
+        dataframe: DataFrame with control points
+        cdem_tif: CDEM raster dataset
+        hrdem_tif: HRDEM raster dataset
+        
+    Returns:
+        DataFrame with elevation columns added
+    """
+    try:
+        # Extract coordinates
+        coords = [(lon, lat) for lon, lat in zip(dataframe.lon, dataframe.lat)]
+        
+        # Extract CDEM values
+        dataframe['CDEM'] = [
+            safe_extract_elevation(lambda: elev[0], 'CDEM') 
+            for elev in cdem_tif.sample(coords)
+        ]
+        
+        # Extract HRDEM values
+        dataframe['HRDEM'] = [
+            safe_extract_elevation(lambda: elev[0], 'HRDEM') 
+            for elev in hrdem_tif.sample(coords)
+        ]
+        
+        # Calculate combined elevation (prefer HRDEM if available)
+        dataframe['pre_DGGS_Elev'] = np.where(
+            np.isnan(dataframe['HRDEM']), 
+            dataframe['CDEM'], 
+            dataframe['HRDEM']
+        )
+        
+        logger.info("Pre-DGGS elevation extraction completed")
+        return dataframe
+        
+    except Exception as e:
+        raise ControlPointsError(f"Failed to extract pre-DGGS elevation: {e}")
+
+
+def find_neighbors(x: float, y: float, dem_tif: rasterio.DatasetReader) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Find neighbors for interpolation.
+    
+    Args:
+        x, y: Coordinates
+        dem_tif: DEM raster dataset
+        
+    Returns:
+        Tuple containing (x_array, y_array, z_array)
+    """
+    try:
+        # Get pixel coordinates
+        x_index, y_index = rasterio.transform.rowcol(dem_tif.transform, x, y)
+        xc, yc = rasterio.transform.xy(dem_tif.transform, x_index, y_index)
+        
+        # Determine which quadrant the point falls in
+        if x > xc and y > yc:
+            x_index_array = [x_index-1, x_index-1, x_index, x_index]
+            y_index_array = [y_index, y_index+1, y_index, y_index+1]
+        elif x > xc and y < yc:
+            x_index_array = [x_index, x_index, x_index+1, x_index+1]
+            y_index_array = [y_index, y_index+1, y_index, y_index+1]
+        elif x < xc and y > yc:
+            x_index_array = [x_index-1, x_index-1, x_index, x_index]
+            y_index_array = [y_index-1, y_index, y_index-1, y_index]
+        elif x < xc and y < yc:
+            x_index_array = [x_index, x_index, x_index+1, x_index+1]
+            y_index_array = [y_index-1, y_index, y_index-1, y_index]
+        else:
+            # Point is exactly on a grid point
+            x_index_array = [x_index, x_index, x_index, x_index]
+            y_index_array = [y_index, y_index, y_index, y_index]
+        
+        # Convert to geographic coordinates
+        x_array, y_array = rasterio.transform.xy(dem_tif.transform, x_index_array, y_index_array)
+        
+        # Extract elevation values
+        coords = [(lon, lat) for lon, lat in zip(x_array, y_array)]
+        z_array = [elev[0] for elev in dem_tif.sample(coords)]
+        
+        return x_array, y_array, z_array
+        
+    except Exception as e:
+        logger.warning(f"Failed to find neighbors for ({x}, {y}): {e}")
+        return [], [], []
+
+
+def extract_cdem_elevation_dggs(lon: float, lat: float, resolution: int, 
+                                cdem_tif: rasterio.DatasetReader, conn: pyRserve.RConnection,
+                                vertical_res: int, interp: str = 'linear') -> float:
+    """
+    Extract CDEM elevation using DGGS modeling.
+    
+    Args:
+        lon, lat: Coordinates
+        resolution: DGGS resolution level
+        cdem_tif: CDEM raster dataset
+        conn: R connection
+        vertical_res: Vertical resolution for rounding
+        interp: Interpolation method
+        
+    Returns:
+        Interpolated elevation value
+    """
+    try:
+        # Get cell centroid coordinates
+        x_y = conn.eval(f'geo_to_centroid({resolution},{lon},{lat})')
+        x, y = x_y[0], x_y[1]
+        
+        # Find neighbors and interpolate
+        x_array, y_array, z_array = find_neighbors(x, y, cdem_tif)
+        
+        if not x_array or NO_DATA_VALUE in z_array:
+            return NO_DATA_VALUE
+        
+        # Perform interpolation
+        cdem_interp = interpolate.interp2d(x_array, y_array, z_array, kind=interp)
+        elevation = cdem_interp(x, y)[0]
+        
+        # Round to specified precision
+        elevation = round(elevation, vertical_res)
+        
+        return elevation
+        
+    except Exception as e:
+        logger.debug(f"CDEM DGGS extraction failed for ({lon}, {lat}): {e}")
+        return NO_DATA_VALUE
+
+
+def extract_hrdem_elevation_dggs(lon: float, lat: float, resolution: int,
+                                 hrdem_tif: rasterio.DatasetReader, hrdem_extent: gpd.GeoDataFrame,
+                                 conn: pyRserve.RConnection, vertical_res: int,
+                                 interp: str = 'linear') -> Optional[float]:
+    """
+    Extract HRDEM elevation using DGGS modeling.
+    
+    Args:
+        lon, lat: Coordinates
+        resolution: DGGS resolution level
+        hrdem_tif: HRDEM raster dataset
+        hrdem_extent: HRDEM extent polygon
+        conn: R connection
+        vertical_res: Vertical resolution for rounding
+        interp: Interpolation method
+        
+    Returns:
+        Interpolated elevation value or None if not available
+    """
+    try:
+        # Get cell centroid coordinates
+        x_y = conn.eval(f'geo_to_centroid({resolution},{lon},{lat})')
+        x, y = x_y[0], x_y[1]
+        
+        # Check if point falls within HRDEM extent
+        point = shapely.geometry.Point(x, y)
+        if not point.within(hrdem_extent.geometry.iloc[0]):
+            return None
+        
+        # Find neighbors and interpolate
+        x_array, y_array, z_array = find_neighbors(x, y, hrdem_tif)
+        
+        if not x_array or NO_DATA_VALUE in z_array:
+            return None
+        
+        # Perform interpolation
+        hrdem_interp = interpolate.interp2d(x_array, y_array, z_array, kind=interp)
+        elevation = hrdem_interp(x, y)[0]
+        
+        # Round to specified precision
+        elevation = round(elevation, vertical_res)
+        
+        return elevation
+        
+    except Exception as e:
+        logger.debug(f"HRDEM DGGS extraction failed for ({lon}, {lat}): {e}")
+        return None
+
+
+def process_control_points_for_resolution(control_points: pd.DataFrame, resolution: int,
+                                        cdem_tif: rasterio.DatasetReader, hrdem_tif: rasterio.DatasetReader,
+                                        hrdem_extent: gpd.GeoDataFrame, conn: pyRserve.RConnection) -> pd.DataFrame:
+    """
+    Process control points for a specific DGGS resolution.
+    
+    Args:
+        control_points: DataFrame with control points
+        resolution: DGGS resolution level
+        cdem_tif: CDEM raster dataset
+        hrdem_tif: HRDEM raster dataset
+        hrdem_extent: HRDEM extent polygon
+        conn: R connection
+        
+    Returns:
+        DataFrame with DGGS elevation columns added
+    """
+    try:
+        vertical_res = RESOLUTION_LOOKUP[resolution]['vertical_res']
+        
+        # Extract CDEM elevations
+        control_points[f'model_CDEM_{resolution}'] = control_points.apply(
+            lambda row: extract_cdem_elevation_dggs(
+                row['lon'], row['lat'], resolution, cdem_tif, conn, vertical_res
+            ), axis=1
+        )
+        
+        # Extract HRDEM elevations
+        control_points[f'model_HRDEM_{resolution}'] = control_points.apply(
+            lambda row: extract_hrdem_elevation_dggs(
+                row['lon'], row['lat'], resolution, hrdem_tif, hrdem_extent, conn, vertical_res
+            ), axis=1
+        )
+        
+        # Calculate combined elevation
+        control_points[f'model_Elev_{resolution}'] = np.where(
+            np.isnan(control_points[f'model_HRDEM_{resolution}']),
+            control_points[f'model_CDEM_{resolution}'],
+            control_points[f'model_HRDEM_{resolution}']
+        )
+        
+        logger.info(f"Processed control points for resolution {resolution}")
+        return control_points
+        
+    except Exception as e:
+        raise ControlPointsError(f"Failed to process control points for resolution {resolution}: {e}")
+
+
+def load_control_points() -> pd.DataFrame:
+    """
+    Load ground control points data.
+    
+    Returns:
+        DataFrame with control points
+    """
+    try:
+        control_points_path = 'Experiment_data/vege_gcp.csv'
+        
+        if not os.path.exists(control_points_path):
+            raise ControlPointsError(f"Control points file not found: {control_points_path}")
+        
+        control_points = pd.read_csv(control_points_path, sep=',')
+        logger.info(f"Loaded {len(control_points)} control points")
+        return control_points
+        
+    except Exception as e:
+        raise ControlPointsError(f"Failed to load control points: {e}")
+
+
+def save_results(control_points: pd.DataFrame) -> None:
+    """
+    Save control points results to CSV file.
+    
+    Args:
+        control_points: DataFrame with results
+    """
+    try:
+        # Create output directory
+        Path("Result").mkdir(exist_ok=True)
+        
+        # Save to CSV
+        output_path = "Result/gcp_result.csv"
+        control_points.to_csv(output_path, index=False)
+        
+        logger.info(f"Results saved to {output_path}")
+        
+    except Exception as e:
+        raise ControlPointsError(f"Failed to save results: {e}")
+
+
+def main():
+    """Main function to orchestrate control points processing."""
+    start_time = time.time()
+    conn = None
+    
+    try:
+        logger.info("Starting control points processing...")
+        
+        # Setup R connection
+        conn = setup_r_connection()
+        
+        # Load DEM data
+        cdem_tif, hrdem_tif, hrdem_extent = load_dem_data()
+        
         try:
-            x_array, y_array, z_array = find_neighbor(x,y,DEM_TIF)
-            if -32767 in z_array:
-                return numpy.nan
-            else:
-                HRDEM_interp = interpolate.interp2d(x_array, y_array, z_array, kind=interp)
-                elevation = HRDEM_interp(x,y)[0]
-                vertical_res = look_up.loc[resolution,'verti_res']
-                elevation = round(elevation,vertical_res)
-                return elevation
-        except:
-            return numpy.nan
-    else:
-        return numpy.nan
+            # Load control points
+            control_points = load_control_points()
+            
+            # Check if control points fall in HRDEM extent
+            control_points['fall_in_test'] = [
+                check_point_in_hrdem_extent(lon, lat, hrdem_extent)
+                for lon, lat in zip(control_points.lon, control_points.lat)
+            ]
+            
+            # Calculate pre-DGGS elevation
+            control_points = extract_pre_dggs_elevation(control_points, cdem_tif, hrdem_tif)
+            
+            # Calculate post-DGGS elevation for each resolution level
+            for resolution in range(16, 30):
+                logger.info(f"Processing resolution level {resolution}...")
+                control_points = process_control_points_for_resolution(
+                    control_points, resolution, cdem_tif, hrdem_tif, hrdem_extent, conn
+                )
+            
+            # Save results
+            save_results(control_points)
+            
+            processing_time = time.time() - start_time
+            logger.info(f"Control points processing completed in {processing_time:.2f} seconds")
+            
+        finally:
+            # Clean up raster datasets
+            cdem_tif.close()
+            hrdem_tif.close()
+            
+    except ControlPointsError as e:
+        logger.error(f"Control points processing failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        sys.exit(1)
+    finally:
+        # Clean up R connection
+        if conn:
+            conn.shutdown()
 
-# read control points dataset
-control_points = pandas.read_csv('Experiment_data/vege_gcp.csv', sep=',')
 
-# test if the control point falls in HRDEM extent and store in a field
-control_points['fall_in_test'] = [fall_in(lon,lat) for lon, lat in zip(control_points.lon, control_points.lat)]
-
-# calculate the pre-DGGS elevation
-control_points = pre_dggs_elevation(control_points)
-control_points['pre_DGGS_Elev'] = numpy.where(numpy.isnan(control_points['HRDEM']), control_points['CDEM'], control_points['HRDEM'])
-
-# calculate the post-DGGS elevation
-# apply the dggs_elevation fuction for each control point at each level
-for i in range(16,30):
-    control_points['model_CDEM_{}'.format(i)] = control_points.apply(lambda row: dggs_elevation_cdem(row['lon'],row['lat'],i), axis=1)
-    control_points['model_HRDEM_{}'.format(i)] = control_points.apply(lambda row: dggs_elevation_hrdem(row['lon'],row['lat'],i), axis=1)
-    control_points['model_Elev_{}'.format(i)] = numpy.where(numpy.isnan(control_points['model_HRDEM_{}'.format(i)]), control_points['model_CDEM_{}'.format(i)], control_points['model_HRDEM_{}'.format(i)])
-
-# save to csv
-control_points.to_csv("Result/gcp_result.csv", index=False)
-
-conn.shutdown()
-print("Processing time: %s seconds" % (time.time() - start_time))
+if __name__ == "__main__":
+    main()
